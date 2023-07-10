@@ -1,0 +1,2 @@
+2023/07/10 15:56:50.039  [D] [main.go:60]  [Tag:sys] frptables 已启动，正在监听日志文件：/www/wwwroot/default/work/dadaad/ftp/request.log
+2023/07/10 15:57:17.051  [D] [main.go:60]  [Tag:sys] frptables 已启动，正在监听日志文件：/www/wwwroot/default/work/dadaad/ftp/request.log
