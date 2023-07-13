@@ -3,6 +3,7 @@ module tails
 go 1.18
 
 require (
+	github.com/go-sql-driver/mysql v1.5.0
 	github.com/hpcloud/tail v1.0.0
 	github.com/syndtr/goleveldb v0.0.0-20181127023241-353a9fca669c
 	github.com/zngw/log v1.2.2

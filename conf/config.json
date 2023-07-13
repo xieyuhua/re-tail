@@ -1,0 +1,8 @@
+{
+  "server_port": 8081,
+  "mysql_username": "gateway",
+  "mysql_password": "HMdbtfFJTFRZCfw7",
+  "mysql_server": "127.0.0.1",
+  "mysql_database": "gateway",
+  "mysql_port": 3306
+}

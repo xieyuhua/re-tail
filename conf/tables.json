@@ -1,0 +1,7 @@
+{
+  "C66F0E686A": {
+    "Table": "szy_app_log",
+    "Fields": ["re_id","http_version", "add_time","create_time", "session_id","site","address","url", "user_agent", "ip"],
+    "Alias": ["id", "http_version", "add_time", "create_time","session_id","site","address","url", "user_agent", "ip"]
+  }
+}

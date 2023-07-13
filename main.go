@@ -1,8 +1,13 @@
 package main
 
 import (
+	"database/sql"
+	"encoding/json"
 	"path/filepath"
 	"time"
+	"io/ioutil"
+	"strings"
+	"flag"
 	"fmt"
 	"strconv"
 	"reflect"
@@ -10,19 +15,76 @@ import (
 	"github.com/zngw/log"
 	"github.com/syndtr/goleveldb/leveldb"
 	"github.com/syndtr/goleveldb/leveldb/errors"
+	_ "github.com/go-sql-driver/mysql"
 )
 
-var db *leveldb.DB
+
+type configuration struct {
+	ServerPort int    `json:"server_port"`
+	Username   string `json:"mysql_username"`
+	Password   string `json:"mysql_password"`
+	Server     string `json:"mysql_server"`
+	Database   string `json:"mysql_database"`
+	Port       int    `json:"mysql_port"`
+}
+
+type tableinfo struct {
+	Table  string   `json:"Table"`
+	Fields []string `json:"Fields"`
+	Alias  []string `json:"Alias"`
+}
+
+var tables map[string]json.RawMessage
+var serverstring string
+var port string
+var verbose bool
+var db *sql.DB
+
+
+const version = "1.0.0"
+const author = "seaslog xie"
+var filedb *leveldb.DB
+
+
+type Args struct {
+	File  *string
+	Table *string
+	Verbose *bool
+}
+
+func getArgs() (Args, bool) {
+	args := Args{}
+	args.File    = flag.String("f", "request.log", " file path, content json format (require)")
+	args.Table   = flag.String("t", "", "Table name (require)")
+	args.Verbose = flag.Bool("d", false, "Verbose debug")
+	flag.Parse()
+	isFlagPassed := func(name string) bool {
+		found := false
+		flag.Visit(func(f *flag.Flag) {
+			if f.Name == name {
+				found = true
+			}
+		})
+		return found
+	}
+	verbose = *args.Verbose
+	found :=  isFlagPassed("f") && isFlagPassed("t")
+	if !found {
+		flag.Usage()
+	}
+	return args, found
+}
+
 
 func getleveldb(path string) int64 {
     var err error
-	db, err = leveldb.OpenFile("leveldb", nil)
-// 	defer db.Close()
+	filedb, err = leveldb.OpenFile("leveldb", nil)
+// 	defer filedb.Close()
 	if err != nil {
-	    log.Error("sys","leveldb.OpenFile failed, err:%v", err)
+	    log.Error("err","leveldb.OpenFile failed, err:%v", err)
 	    return 0
 	}
-	val, err := db.Get([]byte(path), nil)
+	val, err := filedb.Get([]byte(path), nil)
 	var t int64
 	//重新开始
 	if err == errors.ErrNotFound {
@@ -34,13 +96,45 @@ func getleveldb(path string) int64 {
 	return t
 }
 
+func init() {
+    var err error
+	// load configruation file
+	mysqlfullpath := "conf/config.json"
+	mysqlfile, err := ioutil.ReadFile(mysqlfullpath)
+	errorcheck(err)
+
+	data := configuration{}
+	err = json.Unmarshal([]byte(mysqlfile), &data)
+	errorcheck(err)
+
+	serverstring = data.Username + ":" + data.Password + "@tcp(" + data.Server + ":" + strconv.Itoa(data.Port) + ")/" + data.Database
+	port = strconv.Itoa(data.ServerPort)
+
+	// load tables.json file
+	tablesfullpath := "conf/tables.json"
+	tablesdata, err := ioutil.ReadFile(tablesfullpath)
+	errorcheck(err)
+	
+    db, err = sql.Open("mysql", serverstring)
+    errorcheck(err)
+    db.SetMaxOpenConns(20)
+    db.SetMaxIdleConns(20)
+    pingDB(db)
+	err = json.Unmarshal([]byte(tablesdata), &tables)
+	errorcheck(err)
+}
+
+
 //整个for循环，推送数据到channel，消费
 func main() {
     
-    
+	args, isok := getArgs()
+	if !isok {
+		return
+	}
     
 	// 启动用tail监听
-	frpLog, _ := filepath.Abs("request.log")
+	frpLog, _ := filepath.Abs(*args.File)
 	
     t := getleveldb(frpLog)
 	
@@ -57,33 +151,182 @@ func main() {
 		return
 	}
 	
-	log.Trace("sys", "frptables 已启动，正在监听日志文件：%s", frpLog)
+	log.Trace("sys", "re-tail 已启动，正在监听日志文件：%s", frpLog)
 	var line *tail.Line
 	var ok bool
 
 	for {
 		line, ok = <-tails.Lines
-		fmt.Println(line)
-		
+    	if verbose {
+    	    fmt.Println(line.Text)
+    		fmt.Printf("bulk insert done -> %s \n", *args.Table)
+    	}
 		if !ok {
 			log.Error("sys","tail file close reopen, filename:%s\n", tails.Filename)
 			time.Sleep(time.Second)
 			continue
 		}
+    	mysqlInvokeBulk(*args.Table, []byte(line.Text))
 		//保存点位
 		temp,_ := tails.Tell()
-		db.Put([]byte(frpLog), []byte(strconv.Itoa(int(temp))), nil)
+		filedb.Put([]byte(frpLog), []byte(strconv.Itoa(int(temp))), nil)
 	}
-	
-	
-	
-	
-	
 }
 
 
+func mysqlInvokeBulk(auth string, body []byte) {
+	
+	if verbose {
+	    fmt.Printf("bulk -> %s : %s \n", auth, body)
+	}
+	result := "Failed"
+	
+	defer func() {
+		if err := recover(); err != nil && verbose {
+		    // 强结构形式
+		    tempval := fmt.Sprintf("%s : %s", body, err)
+		    log.Error("err",  string(body), tempval)
+			fmt.Println(err)
+		}
+    	if verbose {
+    		fmt.Println(result)
+    	}
+	}()
+	
+	if auth != "" && len(body) > 0 {
+	    //数据
+		if table,  values, err := passBody(auth, body); err != nil {
+			errorcheck(err)
+		} else {
+		    //新增
+			if err := passToMySQL(table,  values); err != nil {
+				errorcheck(err)
+			} else {
+				result = "Ok"
+			}
+		}
+	}
+}
 
+func passBody(auth string, body []byte) (table string, values map[string]interface{}, _ error) {
+	// Get relevant table
+	tableGUID := tables[auth]
+	if len(tableGUID) == 0 {
+	    log.Error("err",  string(body), errors.New("no such table"))
+		return "", nil, errors.New("no such table")
+	}
 
+	tableinfo := tableinfo{}
+	if err := json.Unmarshal(tableGUID, &tableinfo); err != nil {
+	    log.Error("err",  string(body), errors.New("table.json issue"))
+		return "",  nil, errors.New("table.json issue")
+	}
+
+	// Get table name / alias / fields
+	table   = tableinfo.Table
+	alias  := tableinfo.Alias
+	fields := tableinfo.Fields
+
+	if len(table) == 0 || len(alias) == 0 || len(fields) == 0 {
+	    log.Error("err",  string(body), errors.New("issue with table values"))
+		return "",  nil, errors.New("issue with table values")
+	}
+	
+	var objmap map[string]any
+	d := json.NewDecoder(strings.NewReader(string(body)))
+	d.UseNumber()
+	err := d.Decode(&objmap)
+	if err != nil {
+	    log.Error("err",  string(body), errors.New("load body issue"))
+		return "",  nil, errors.New("load body issue")
+	}
+	
+    values = make(map[string]any)
+	// Pull data from body and put into comma delimited values
+	for i := 0; i < len(alias); i++ {
+		tempval := objmap[string(alias[i])]
+		var str string
+		switch tempval.(type) {
+    		case int,uint,int8,uint8,int16,uint16,int32,uint32,int64,uint64:
+    			str = strconv.Itoa(tempval.(int))
+    			break
+    		case float64,float32:
+    			str = fmt.Sprintf("%f", tempval)
+    			break
+    		case string:
+    			str = tempval.(string)
+    			break
+    		default:
+    			str = fmt.Sprintf("%v", tempval)
+		}
+		values[fields[i]] = str
+	}
+	return table, values, nil
+}
+
+func passToMySQL(table string,  data map[string]interface{}) (err error) {
+
+	value := make([]interface{}, 0, len(data)*2)
+	fields  := ""
+	values  := ""
+	fields2 := ""
+
+	for k, v := range data {
+	    value = append(value, v) 
+		if fields == ""{
+			fields = "`"+k+"`"
+			values = "?"
+			fields2 = k+"= ?"
+		}else{
+			fields += ",`"+k+"`"
+			values += ",?"
+			fields2 += ","+k+"= ?"
+		}
+	}
+    
+	if len(value) == 0 {
+	    log.Error("err", "no such len")
+	    return errors.New("no such len")
+	}
+	//重复事情
+	for _, v := range value {
+	    value = append(value, v) 
+	}
+	
+	sql := "INSERT INTO "+table+" ("+ fields +") VALUES ("+values+") ON DUPLICATE KEY UPDATE " + fields2
+	stmt, err := db.Prepare(sql)
+	defer stmt.Close() //关闭之
+	if err != nil {
+	    log.Error("err",  err.Error())
+	    return errors.New(err.Error())
+	}
+	res, err := stmt.Exec(value...)
+	if err != nil {
+	    log.Error("err",  err.Error())
+	    return errors.New(err.Error())
+	}
+	
+	id, err := res.LastInsertId()
+	if err != nil {
+	    log.Error("err",  err.Error())
+	    return errors.New(err.Error())
+	}
+    
+	fmt.Println("Insert id", id)
+
+	return err
+}
+
+func errorcheck(err error) {
+	if err != nil {
+		panic(err.Error())
+	}
+}
+
+func pingDB(db *sql.DB) {
+	err := db.Ping()
+	errorcheck(err)
+}
 
 // 通过接口来获取任意参数
 func DoFiled(input interface{}) {
