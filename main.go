@@ -1,21 +1,23 @@
 package main
 
 import (
-	"database/sql"
-	"encoding/json"
-	"path/filepath"
-	"time"
-	"io/ioutil"
-	"strings"
-	"flag"
-	"fmt"
-	"strconv"
-	"reflect"
-	"github.com/hpcloud/tail"
-	"github.com/zngw/log"
-	"github.com/syndtr/goleveldb/leveldb"
-	"github.com/syndtr/goleveldb/leveldb/errors"
-	_ "github.com/go-sql-driver/mysql"
+    "database/sql"
+    "encoding/json"
+    "path/filepath"
+    "bufio"
+    "os"
+    "time"
+    "io/ioutil"
+    "strings"
+    "flag"
+    "fmt"
+    "strconv"
+    "reflect"
+    "github.com/hpcloud/tail"
+    "github.com/zngw/log"
+    "github.com/syndtr/goleveldb/leveldb"
+    "github.com/syndtr/goleveldb/leveldb/errors"
+    _ "github.com/go-sql-driver/mysql"
 )
 
 
@@ -76,14 +78,80 @@ func getArgs() (Args, bool) {
 }
 
 
+//根据seek 划分文件
+func newLog(path string, frpLog string, tails *tail.Tail) {
+    //重新命名一个文件
+    t := time.Now()
+    t.AddDate(0,0,-1)
+    str := fmt.Sprintf("%s%s", path, t.AddDate(0,0,-1).Format("2006-01-02"))
+    _, err := os.Stat(str)
+    if err != nil {
+        if os.IsNotExist(err) {
+            
+        } else {
+            return
+        }
+    } else {
+       return 
+    }
+    seek := getleveldb(frpLog)
+    if seek==0{
+         return
+    }
+    filedb.Put([]byte(frpLog), []byte(strconv.Itoa(0)), nil)
+    err = os.Rename(path, str)
+    if err != nil {
+        log.Error("err",  err.Error())
+        return
+    }
+    //重新归零
+    tails.SetSeekTo(0)
+    // 打开文件
+    file, err :=  os.OpenFile(str, os.O_RDWR|os.O_CREATE, os.ModePerm)
+    if err != nil {
+        log.Error("err",  err.Error())
+        return
+    }
+    defer file.Close()
+    // 创建Scanner对象
+    scanner := bufio.NewScanner(file)
+    // 定位到指定偏移量
+    file.Seek(seek, 0)
+    
+    //创建文件
+    newfile, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0666)
+    if err != nil {
+        log.Error("err",  "rror opening file:", err)
+        return
+    }
+    defer newfile.Close()
+    // 遍历文件，读取数据并输出
+    write := bufio.NewWriter(newfile)
+    for scanner.Scan() {
+        line := scanner.Text()
+         _, err = write.WriteString((line)+"\n")
+        if err != nil {
+            log.Error("err",  "Error writing to output file 1:", err)
+            return
+        }
+        write.Flush()
+    }
+    
+    if err := scanner.Err(); err != nil {
+        log.Error("err",  err.Error())
+        return
+    }
+    
+    //截取文件
+    err = file.Truncate(seek)
+    if err != nil {
+        log.Error("err",  err.Error())
+        return
+    }
+    return
+}
+//获取点位
 func getleveldb(path string) int64 {
-    var err error
-	filedb, err = leveldb.OpenFile("leveldb", nil)
-// 	defer filedb.Close()
-	if err != nil {
-	    log.Error("err","leveldb.OpenFile failed, err:%v", err)
-	    return 0
-	}
 	val, err := filedb.Get([]byte(path), nil)
 	var t int64
 	//重新开始
@@ -98,6 +166,13 @@ func getleveldb(path string) int64 {
 
 func init() {
     var err error
+    
+	filedb, err = leveldb.OpenFile("leveldb", nil)
+	if err != nil {
+	    log.Error("err","leveldb.OpenFile failed, err:%v", err)
+	    return 
+	}
+    
 	// load configruation file
 	mysqlfullpath := "conf/config.json"
 	mysqlfile, err := ioutil.ReadFile(mysqlfullpath)
@@ -132,18 +207,23 @@ func main() {
 	if !isok {
 		return
 	}
-    
+    defer filedb.Close()
 	// 启动用tail监听
 	frpLog, _ := filepath.Abs(*args.File)
 	
-    t := getleveldb(frpLog)
+	//分割日志，未读取完的保留数据
+	//重启日志分割
+	//因为TailFile  读取中文件，其他也在输入，需要修改seek位置置零
+// 	newLog(*args.File, frpLog)
+	
+	t := getleveldb(frpLog)
 	
 	//开始
 	tails, err := tail.TailFile(frpLog, tail.Config{
 		ReOpen:    true,                                 // 重新打开
 		Follow:    true,                                 // 是否跟随
 		Location:  &tail.SeekInfo{Offset: t, Whence: 0}, // 从文件的哪个地方开始读
-		MustExist: true,                                // 文件不存在不报错
+		MustExist: false,                                // 文件不存在不报错
 		Poll:      true,
 	})
 	if err != nil {
@@ -154,7 +234,8 @@ func main() {
 	log.Trace("sys", "re-tail 已启动，正在监听日志文件：%s", frpLog)
 	var line *tail.Line
 	var ok bool
-
+	
+    //读取数据
 	for {
 		line, ok = <-tails.Lines
     	if verbose {
@@ -162,14 +243,27 @@ func main() {
     		fmt.Printf("bulk insert done -> %s \n", *args.Table)
     	}
 		if !ok {
+		   //重新归零
+            // tails.SetSeekTo(0)
 			log.Error("sys","tail file close reopen, filename:%s\n", tails.Filename)
 			time.Sleep(time.Second)
 			continue
 		}
+		
+		//新增批量
     	mysqlInvokeBulk(*args.Table, []byte(line.Text))
-		//保存点位
-		temp,_ := tails.Tell()
+    	
+    	
+    	//保存点位
+    	temp,_ := tails.Tell()
 		filedb.Put([]byte(frpLog), []byte(strconv.Itoa(int(temp))), nil)
+		fmt.Println(strconv.Itoa(int(temp)))
+		
+		//b备份文件大小
+		if int(temp) > 10*1204*1024 {
+		    newLog(*args.File, frpLog ,tails)
+		}
+        // DoMethod(tails)
 	}
 }
 
@@ -326,6 +420,7 @@ func errorcheck(err error) {
 func pingDB(db *sql.DB) {
 	err := db.Ping()
 	errorcheck(err)
+	return
 }
 
 // 通过接口来获取任意参数

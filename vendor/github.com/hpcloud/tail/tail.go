@@ -393,6 +393,15 @@ func (tail *Tail) seekEnd() error {
 	return tail.seekTo(SeekInfo{Offset: 0, Whence: os.SEEK_END})
 }
 
+func (tail *Tail) SetSeekTo(pos int64) error {
+	err := tail.reopen()
+	if err != nil {
+		return err
+	}
+	tail.openReader()
+	return nil
+}
+
 func (tail *Tail) seekTo(pos SeekInfo) error {
 	_, err := tail.file.Seek(pos.Offset, pos.Whence)
 	if err != nil {
